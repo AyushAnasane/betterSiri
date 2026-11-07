@@ -1,68 +1,119 @@
-import { app, BrowserWindow } from 'electron'
-import { createRequire } from 'node:module'
-import { fileURLToPath } from 'node:url'
-import path from 'node:path'
 
-const require = createRequire(import.meta.url)
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
+import { app, BrowserWindow, ipcMain } from "electron";
+import { fileURLToPath } from "node:url";
+import { existsSync } from "node:fs";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 
-// The built directory structure
-//
-// ├─┬─┬ dist
-// │ │ └── index.html
-// │ │
-// │ ├─┬ dist-electron
-// │ │ ├── main.js
-// │ │ └── preload.mjs
-// │
-process.env.APP_ROOT = path.join(__dirname, '..')
+const execFileAsync = promisify(execFile);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// 🚧 Use ['ENV_NAME'] avoid vite:define plugin - Vite@2.x
-export const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL']
-export const MAIN_DIST = path.join(process.env.APP_ROOT, 'dist-electron')
-export const RENDERER_DIST = path.join(process.env.APP_ROOT, 'dist')
+process.env.APP_ROOT = path.join(__dirname, "..");
 
-process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL ? path.join(process.env.APP_ROOT, 'public') : RENDERER_DIST
+export const VITE_DEV_SERVER_URL = process.env["VITE_DEV_SERVER_URL"];
+export const RENDERER_DIST = path.join(process.env.APP_ROOT, "dist");
 
-let win: BrowserWindow | null
+process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL
+  ? path.join(process.env.APP_ROOT, "public")
+  : RENDERER_DIST;
+
+let win: BrowserWindow | null = null;
+
+ipcMain.handle("transcribe-audio", async (_event, audioBase64: string) => {
+  if (typeof audioBase64 !== "string" || !audioBase64.length) {
+    throw new Error("No audio data received.");
+  }
+
+  const buffer = Buffer.from(audioBase64, "base64");
+
+  if (buffer.length < 44) {
+    throw new Error("The recording is empty or invalid.");
+  }
+
+  if (buffer.length > 25 * 1024 * 1024) {
+    throw new Error("Recording is too large.");
+  }
+
+  const modelPath = path.join(
+    process.env.APP_ROOT!,
+    "models",
+    "ggml-base.en.bin"
+  );
+
+  if (!existsSync(modelPath)) {
+    throw new Error("Whisper model not found in the models folder.");
+  }
+
+  const tempDirectory = await mkdtemp(
+    path.join(tmpdir(), "bettersiri-")
+  );
+
+  const audioPath = path.join(tempDirectory, "recording.wav");
+
+  try {
+    await writeFile(audioPath, buffer);
+
+    const { stdout } = await execFileAsync(
+      "whisper-cli",
+      [
+        "-m",
+        modelPath,
+        "-f",
+        audioPath,
+        "-l",
+        "en",
+        "-nt",
+        "-np",
+      ],
+      {
+        timeout: 120000,
+        maxBuffer: 10 * 1024 * 1024,
+      }
+    );
+
+    return stdout.trim();
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Whisper transcription failed.";
+
+    throw new Error(message);
+  } finally {
+    await rm(tempDirectory, { recursive: true, force: true });
+  }
+});
 
 function createWindow() {
   win = new BrowserWindow({
-    icon: path.join(process.env.VITE_PUBLIC, 'electron-vite.svg'),
+    width: 1000,
+    height: 700,
     webPreferences: {
-      preload: path.join(__dirname, 'preload.mjs'),
+      preload: path.join(__dirname, "preload.mjs"),
+      contextIsolation: true,
+      nodeIntegration: false,
     },
-  })
-
-  // Test active push message to Renderer-process.
-  win.webContents.on('did-finish-load', () => {
-    win?.webContents.send('main-process-message', (new Date).toLocaleString())
-  })
+  });
 
   if (VITE_DEV_SERVER_URL) {
-    win.loadURL(VITE_DEV_SERVER_URL)
+    win.loadURL(VITE_DEV_SERVER_URL);
   } else {
-    // win.loadFile('dist/index.html')
-    win.loadFile(path.join(RENDERER_DIST, 'index.html'))
+    win.loadFile(path.join(RENDERER_DIST, "index.html"));
   }
 }
 
-// Quit when all windows are closed, except on macOS. There, it's common
-// for applications and their menu bar to stay active until the user quits
-// explicitly with Cmd + Q.
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit()
-    win = null
+app.on("window-all-closed", () => {
+  if (process.platform !== "darwin") {
+    app.quit();
+    win = null;
   }
-})
+});
 
-app.on('activate', () => {
-  // On OS X it's common to re-create a window in the app when the
-  // dock icon is clicked and there are no other windows open.
+app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0) {
-    createWindow()
+    createWindow();
   }
-})
+});
 
-app.whenReady().then(createWindow)
+app.whenReady().then(createWindow);
